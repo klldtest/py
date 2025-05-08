@@ -2949,29 +2949,41 @@ class ClientPartyMember(PartyMemberBase, Patchable):
 
             .. note::
 
-                Cosmetics other than outfits require a path, usually the
-                correct path will be set by default, but you really should
-                handle this just in case. Read more about it
-                `here <https://rebootpy.readthedocs.io/en/latest/faq.html#why-are-some-cosmetics-invisible-dances-not-playing>`_.
+                You don't have to include the full path of the asset. The EID
+                is enough.
         run_for: Optional[:class:`float`]
             Seconds the emote should run for before being cancelled. ``None``
             (default) means it will run indefinitely and you can then clear it
             with :meth:`PartyMember.clear_emote()`.
         key: Optional[:class:`str`]
-            The encryption key to use for this emote.
+            The encyption key to use for this emote.
         section: Optional[:class:`int`]
             The section.
 
         Raises
         ------
         HTTPException
-            An error occurred while requesting.
+            An error occured while requesting.
         """
         if asset != '' and '.' not in asset:
-            asset = f'/BRCosmetics/Athena/Items/Cosmetics/Dances/{asset}.{asset}'
+          asset = ("/BRCosmetics/Athena/Items/Cosmetics/Dances/{0}.{0}".format(asset))
+        else:
+          prop = self.meta.get_prop('Default:FrontendEmote_j')
+          asset = prop['FrontendEmote']['emoteItemDef']
 
-        prop = self.meta.set_emote(
+        if asset != '' and '.' not in asset:
+            emote_def = ("emoteItemDef'/Game/Athena/Items/Cosmetics/Dances/{0}.{0}'".format(asset))
+        else:
+            emote_def = asset
+
+        meta = self.party.me.meta                  
+        prop = meta.set_emote(
             emote=asset,
+            emote_ekey=key,
+            section=section
+        )
+        prop1 = meta.set_emote(
+            emote=emote_def,
             emote_ekey=key,
             section=section
         )
@@ -2983,7 +2995,8 @@ class ClientPartyMember(PartyMemberBase, Patchable):
             )
 
         if not self.edit_lock.locked():
-            return await self.patch(updated=prop)
+            await self.patch(updated=prop)
+            return await self.patch(updated=prop1)
 
     async def set_jam_emote(self, asset: str, *,
                             run_for: Optional[float] = None,
