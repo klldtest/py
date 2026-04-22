@@ -169,7 +169,7 @@ class PresenceParty:
         self.app_id = data.get('appId')
         self.build_id = data.get('buildId')
 
-        if self.build_id is not None and self.build_id.startswith('1:1:'):
+        if self.build_id is not None and self.build_id.startswith('1:3:'):
             self.net_cl = self.build_id[4:]
         else:
             self.net_cl = None
@@ -297,7 +297,7 @@ class Presence:
         self.status = data['Status']
         self.playing = data['bIsPlaying']
         self.joinable = data.get('bIsJoinable', False)
-        self.has_voice_support = data['bHasVoiceSupport']
+        self.has_voice_support = data.get('bHasVoiceSupport', False)
         self.session_id = data.get('SessionId') or None
 
         raw_properties = data.get('Properties', {})

@@ -26,7 +26,6 @@ SOFTWARE.
 """
 
 import random
-import types
 
 from typing import Optional, Any
 from enum import Enum as OriginalEnum
@@ -188,6 +187,7 @@ class Platform(Enum):
     SWITCH        = 'SWT'
     IOS           = 'IOS'
     ANDROID       = 'AND'
+    SWITCH_2      = 'SWT2'
     UNKNOWN       = 'UNKNOWN'
 
     @classmethod
@@ -369,14 +369,17 @@ class Season(Enum):
 
 
 class RankingType(Enum):
-    BATTLE_ROYALE   = 'ranked-br'
-    ZERO_BUILD      = 'ranked-zb'
-    ROCKET_RACING   = 'delmar-competitive'
-    RELOAD          = 'ranked_blastberry_build'
-    RELOAD_ZB       = 'ranked_blastberry_nobuild'
-    BALLISTIC       = 'ranked-feral'
-    OG              = 'ranked-figment-build'
-    OG_ZERO_BUILD   = 'ranked-figment-nobuild'
+    BATTLE_ROYALE_LEGACY    = 'ranked-br'
+    ZERO_BUILD              = 'ranked-zb'
+    ROCKET_RACING           = 'delmar-competitive'
+    RELOAD                  = 'ranked_blastberry_build'
+    RELOAD_ZB               = 'ranked_blastberry_nobuild'
+    BALLISTIC               = 'ranked-feral'
+    OG                      = 'ranked-figment-build'
+    OG_ZERO_BUILD           = 'ranked-figment-nobuild'
+    CROWN_JAM               = 'ranked-pimlico'
+    BATTLE_ROYALE           = 'ranked-br-combined'
+    ARENAS_BOXFIGHTS        = 'ranked-squareclub'
 
 
 class Rank(Enum):
@@ -404,3 +407,45 @@ class Rank(Enum):
 class StatsCollectionType(Enum):
     FISH      = 'collection_fish'
     CHARACTER = 'collection_character'
+
+
+class Country(Enum):
+    ARGENTINA       = "argentina"
+    AUSTRALIA       = "australia"
+    BELARUS         = "belarus"
+    BELGIUM         = "belgium"
+    BRAZIL          = "brazil"
+    CANADA          = "canada"
+    COLOMBIA        = "colombia"
+    CZECHREPUBLIC   = "czechrepublic"
+    DENMARK         = "denmark"
+    EGYPT           = "egypt"
+    ENGLAND         = "england"
+    FRANCE          = "france"
+    GERMANY         = "germany"
+    GLOBAL          = "global"
+    ICELAND         = "iceland"
+    IRELAND         = "ireland"
+    ITALY           = "italy"
+    JAPAN           = "japan"
+    LATVIA          = "latvia"
+    MEXICO          = "mexico"
+    NETHERLANDS     = "netherlands"
+    NEWZEALAND      = "newzealand"
+    NIGERIA         = "nigeria"
+    NORWAY          = "norway"
+    POLAND          = "poland"
+    PORTUGAL        = "portugal"
+    RUSSIA          = "russia"
+    SAUDIARABIA     = "saudiarabia"
+    SCOTLAND        = "scotland"
+    SOUTHKOREA      = "southkorea"
+    SPAIN           = "spain"
+    SWEDEN          = "sweden"
+    SWITZERLAND     = "switzerland"
+    TURKEY          = "turkey"
+    UKRAINE         = "ukraine"
+    UNITEDKINGDOM   = "unitedkingdom"
+    UNITEDSTATES    = "unitedstates"
+    URUGUAY         = "uruguay"
+    WALES           = "wales"

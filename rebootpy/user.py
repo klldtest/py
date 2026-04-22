@@ -24,7 +24,6 @@ SOFTWARE.
 
 import logging
 
-from aioxmpp import JID
 from typing import TYPE_CHECKING, Any, List, Optional
 from .enums import (UserSearchPlatform, UserSearchMatchType,
                     StatsCollectionType, Season)
@@ -113,12 +112,14 @@ class ExternalAuth:
 
 class UserBase:
     __slots__ = ('client', '_epicgames_display_name', '_external_display_name',
-                 '_id', '_external_auths')
+                 '_id', '_external_auths', '_disabled')
 
     def __init__(self, client: 'BasicClient',
                  data: dict,
+                 disabled: bool = False,
                  **kwargs: Any) -> None:
         self.client = client
+        self._disabled = disabled
         if data:
             self._update(data)
 
@@ -185,9 +186,16 @@ class UserBase:
         return self._epicgames_display_name is not None
 
     @property
-    def jid(self) -> JID:
+    def jid(self) -> str:
         """:class:`aioxmpp.JID`: The JID of the user."""
-        return JID.fromstr('{0.id}@{0.client.service_host}'.format(self))
+        return f'{self.id}@{self.client.service_host}'
+
+    @property
+    def disabled(self) -> str:
+        """:class:`bool`: Whether or not this users account is disabled,
+        meaning they cannot login. Other attributes/functions may not work
+        properly if this is true."""
+        return self._disabled
 
     async def fetch(self) -> None:
         """|coro|
@@ -301,26 +309,6 @@ class UserBase:
             season=season
         )
 
-    async def fetch_gold_bars(self) -> int:
-        """|coro|
-
-        Fetches this users gold bars.
-
-        Raises
-        ------
-        HTTPException
-            An error occurred while requesting.
-
-        Returns
-        -------
-        int
-            The amount of gold bars.
-        """  # noqa
-
-        return await self.client.fetch_gold_bars(
-            user_id=self.id
-        )
-
     async def fetch_br_stats_collection(self, collection: StatsCollectionType,
                                         start_time: Optional[
                                             DatetimeOrTimestamp] = None,
@@ -429,6 +417,44 @@ class UserBase:
             season=season,
             start_time=start_time,
             end_time=end_time
+        )
+
+    async def fetch_event_tokens(self) -> list:
+        """|coro|
+
+        Fetches this user's event tokens.
+
+        Raises
+        ------
+        HTTPException
+            An error occurred while requesting.
+
+        Returns
+        -------
+        list[:class:`str`]
+            A list of event tokens.
+        """  # noqa
+        return await self.client.fetch_event_tokens(
+            self.id,
+        )
+
+    async def fetch_flag(self) -> list:
+        """|coro|
+
+        Fetches this user's flag.
+
+        Raises
+        ------
+        HTTPException
+            An error occurred while requesting.
+
+        Returns
+        -------
+        :class:`Country` | None
+            The users flag.
+        """  # noqa
+        return await self.client.fetch_flag(
+            self.id,
         )
 
     def _update(self, data: dict) -> None:
@@ -561,11 +587,11 @@ class ClientUser(UserBase):
         return '{} {}'.format(self.name, self.last_name)
 
     @property
-    def jid(self) -> JID:
+    def jid(self) -> str:
         """:class:`aioxmpp.JID`: The JID of the client. Includes the
         resource part.
         """
-        return self.client.xmpp.xmpp_client.local_jid
+        return self.client.xmpp.local_jid
 
     def _update(self, data: dict) -> None:
         super()._update(data)
@@ -600,8 +626,9 @@ class User(UserBase):
 
     def __init__(self, client: 'BasicClient',
                  data: dict,
+                 disabled: bool = False,
                  **kwargs: Any) -> None:
-        super().__init__(client, data)
+        super().__init__(client, data, disabled)
 
     def __repr__(self) -> str:
         return ('<User id={0.id!r} display_name={0.display_name!r} '

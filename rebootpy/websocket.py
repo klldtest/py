@@ -29,6 +29,8 @@ import aiohttp
 import json
 import functools
 import logging
+import base64
+import datetime
 
 from .message import FriendMessage, PartyMessage
 
@@ -36,6 +38,16 @@ from aiohttp import hdrs, helpers, client_reqrep, connector
 from aiohttp.http import StreamWriter, HttpVersion10, HttpVersion11
 
 log = logging.getLogger(__name__)
+
+
+def decode_message_body(body: str) -> str:
+    try:
+        decoded = base64.b64decode(body).decode('utf-8')
+        decoded = decoded.rstrip('\x00')
+        parsed = json.loads(decoded)
+        return parsed.get('msg', body)
+    except (ValueError, KeyError, json.JSONDecodeError, Exception):
+        return body
 
 
 class WebsocketRequest(aiohttp.client_reqrep.ClientRequest):
@@ -99,7 +111,7 @@ class WebsocketRequest(aiohttp.client_reqrep.ClientRequest):
                                        "HTTP/1.1"
         await writer.write_headers(status_line, self.headers)
 
-        self._writer = self.loop.create_task(self.write_bytes(writer, conn))
+        self._writer = self.loop.create_task(self.write_bytes(writer, conn, None))
 
         response_class = self.response_class
         assert response_class is not None
@@ -123,6 +135,7 @@ class WebsocketClient:
 
         self.wss_session = None
         self.websocket = None
+        self.ws_task = None
 
         self.heartbeat_started = False
 
@@ -135,7 +148,7 @@ class WebsocketClient:
     async def send_presence(self, connection_id: str) -> None:
         await self.client.http.chat_send_presence(
             connection_id=connection_id,
-            auth=f'bearer {self.client.auth.chat_access_token}'
+            auth="EAS_ACCESS_TOKEN"
         )
 
     async def send_heartbeat(self, delay: int) -> None:
@@ -155,8 +168,9 @@ class WebsocketClient:
 
         data = json.loads(raw_json[:-1]) if len(raw_json) >= 3 else {}
 
-        log.debug(f'Received websocket message with type `{message_type}` '
-                  f'with the headers {headers}` and body \n{data}.')
+        log.debug(
+            f'{datetime.datetime.now(datetime.timezone.utc)} - Received websocket message with type'
+            f' {message_type} with the headers {headers} and body \n{data}.')
 
         if message_type == 'CONNECTED' and not self.heartbeat_started:
             self.heartbeat_started = True
@@ -171,9 +185,11 @@ class WebsocketClient:
             await self.send_presence(
                 connection_id=data['connectionId']
             )
-        elif (message_type == 'MESSAGE' and
-              'type' in data and
-              data['type'] == 'social.chat.v1.NEW_WHISPER'):
+        elif (
+            message_type == 'MESSAGE' and
+            data.get('type') == 'social.chat.v1.NEW_MESSAGE' and
+            data.get('payload').get('conversation').get('type') == 'dm'
+        ):
             author = self.client.get_friend(
                 data['payload']['message']['senderId']
             )
@@ -189,17 +205,22 @@ class WebsocketClient:
                     return
 
             try:
+                decoded_content = decode_message_body(
+                    data['payload']['message']['body']
+                )
                 m = FriendMessage(
                     client=self.client,
                     author=author,
-                    content=data['payload']['message']['body']
+                    content=decoded_content
                 )
                 self.client.dispatch_event('friend_message', m)
             except ValueError:
                 pass
-        elif (message_type == 'MESSAGE' and
-              'type' in data and
-              data['type'] == 'social.chat.v1.NEW_MESSAGE'):
+        elif (
+            message_type == 'MESSAGE' and
+            data.get('type') == 'social.chat.v1.NEW_MESSAGE' and
+            data.get('payload').get('conversation').get('type') == 'party'
+        ):
             user_id = data['payload']['message']['senderId']
             party = self.client.party
 
@@ -207,16 +228,25 @@ class WebsocketClient:
                     or user_id not in party._members):
                 return
 
+            decoded_content = decode_message_body(
+                data['payload']['message']['body']
+            )
             self.client.dispatch_event('party_message', PartyMessage(
                 client=self.client,
                 party=party,
                 author=party._members[data['payload']['message']['senderId']],
-                content=data['payload']['message']['body']
+                content=decoded_content
             ))
+        elif (
+            message_type == 'ERROR' and
+            data.get('statusCode') == 4019
+        ):
+            log.debug('STOMP authentication token is now invalid')
+            await self.restart()
 
     async def connect_to_websocket(self) -> None:
         headers = {
-            'Authorization': f'Bearer {self.client.auth.chat_access_token}',
+            'Authorization': f'Bearer {self.client.auth.eas_access_token}',
             'Epic-Connect-Protocol': 'stomp',
             "Sec-WebSocket-Protocol": "v10.stomp,v11.stomp,v12.stomp",
             'Epic-Connect-Device-Id': " ",
@@ -235,11 +265,29 @@ class WebsocketClient:
                 await self.parse_message(msg.data.decode())
 
     async def run(self) -> None:
+        log.debug('Starting STOMP websocket client')
         await self.set_session()
-        self.client.loop.create_task(self.connect_to_websocket())
+        self.ws_task = self.client.loop.create_task(
+            self.connect_to_websocket()
+        )
 
     async def close(self) -> None:
+        log.debug('Closing STOMP websocket client')
         await self.websocket.close()
         await self.wss_session.close()
 
         self.heartbeat_started = False
+
+    async def restart(self) -> None:
+        log.debug('Restarting STOMP websocket client')
+        await self.close()
+
+        if self.ws_task:
+            self.ws_task.cancel()
+            try:
+                await self.ws_task
+            except asyncio.CancelledError:
+                pass
+            self.ws_task = None
+
+        await self.run()

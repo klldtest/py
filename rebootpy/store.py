@@ -26,7 +26,6 @@ SOFTWARE.
 
 import re
 import datetime
-import json
 
 from typing import TYPE_CHECKING, Optional, List
 
@@ -54,7 +53,7 @@ class StoreItem:
         self._monthly_limit = data['monthlyLimit']
         self._offer_id = data['offerId']
         self._offer_type = data['offerType']
-        self._refundable = data['refundable']
+        self._refund_type = data['refundType']
         self._items_grants = data['itemGrants']
         self._panel = data['sortPriority']
         self._meta_info = data.get('metaInfo', [])
@@ -72,7 +71,7 @@ class StoreItem:
     @property
     def display_names(self) -> List[str]:
         """List[:class:`str`]: The display names for this item."""
-        match = re.search(r'^\[VIRTUAL][0-9]+ x (.*) for [0-9]+ .*$',
+        match = re.search(r'^\[VIRTUAL][0-9]+ x (.*) for -?\d+ .*$',
                           self._dev_name).group(1)
         return re.split(r', [0-9]+ x ', match)
 
@@ -158,7 +157,7 @@ class StoreItem:
         """:class:`bool`: ``True`` if item is refundable else
         ``False``.
         """
-        return self._refundable
+        return self._refund_type == 'UserRefundable'
 
     @property
     def grants(self) -> List[dict]:

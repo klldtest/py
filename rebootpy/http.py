@@ -30,6 +30,8 @@ import re
 import time
 import functools
 import datetime
+import base64
+import uuid
 
 from typing import TYPE_CHECKING, Iterable, List, Optional, Any, Union, Tuple
 from urllib.parse import quote as urllibquote
@@ -140,7 +142,7 @@ class GraphQLRequest:
         components = text.split('_')
         return components[0] + ''.join(x.title() for x in components[1:])
 
-    def __iter__(self) -> str:
+    def __iter__(self): 
         for key, value in self.__dict__.items():
             if value is None:
                 continue
@@ -305,7 +307,7 @@ class FortniteContentWebsite(Route):
 
 
 class FortnitePublicService(Route):
-    BASE = 'https://fortnite-public-service-prod11.ol.epicgames.com'
+    BASE = 'https://fngw-mcp-gc-livefn.ol.epicgames.com'
     AUTH = 'FORTNITE_ACCESS_TOKEN'
 
 
@@ -346,6 +348,21 @@ class ChatService(Route):
 
 class HabaneroService(Route):
     BASE = 'https://fn-service-habanero-live-public.ogs.live.on.epicgames.com'
+    AUTH = 'FORTNITE_ACCESS_TOKEN'
+
+
+class EpicGamesProductService(Route):
+    BASE = 'https://egp-idsoc-proxy-prod.ol.epicgames.com'
+    AUTH = 'FORTNITE_ACCESS_TOKEN'
+
+
+class PublicKeyService(Route):
+    BASE = 'https://publickey-service-live.ecosec.on.epicgames.com'
+    AUTH = 'FORTNITE_ACCESS_TOKEN'
+
+
+class LauncherPublicService(Route):
+    BASE = 'https://launcher-public-service-prod06.ol.epicgames.com'
     AUTH = 'FORTNITE_ACCESS_TOKEN'
 
 
@@ -431,7 +448,7 @@ class HTTPClient:
 
     @property
     def user_agent(self) -> str:
-        return 'Fortnite/{0.client.build} {0.client.os}'.format(self)
+        return f'Fortnite/{self.client.build} {self.client.os}'
 
     def get_auth(self, auth: str) -> str:
         u_auth = auth.upper()
@@ -444,6 +461,10 @@ class HTTPClient:
             return self.client.auth.ios_authorization
         elif u_auth == 'FORTNITE_ACCESS_TOKEN':
             return self.client.auth.authorization
+        elif u_auth == 'EAS_ACCESS_TOKEN':
+            return self.client.auth.eas_authorization
+        elif u_auth == 'EOS_ACCESS_TOKEN':
+            return self.client.auth.eos_authorization
         return auth
 
     def add_header(self, key: str, val: Any) -> None:
@@ -1193,25 +1214,14 @@ class HTTPClient:
             }
         ))
 
-    async def account_graphql_get_clients_external_auths(self,
-                                                         **kwargs: Any
-                                                         ) -> dict:
-        return await self.graphql_request(GraphQLRequest(
-            query="""
-            query AccountQuery {
-                Account {
-                    myAccount {
-                        externalAuths {
-                            type
-                            accountId
-                            externalAuthId
-                            externalDisplayName
-                        }
-                    }
-                }
-            }
-            """
-        ), **kwargs)
+    async def account_get_multiple_disabled_by_user_id(self,
+                                                       user_ids: Iterable[str],
+                                                       **kwargs: Any) -> list:
+        params = {
+            'accountId': ','.join(user_ids)
+        }
+        r = EpicGamesProductService('/account/api/public/account')
+        return await self.get(r, params=params, **kwargs)
 
     ###################################
     #          Eula Tracking          #
@@ -1245,8 +1255,8 @@ class HTTPClient:
 
     async def fortnite_grant_access(self, **kwargs: Any) -> Any:
         r = FortnitePublicService(
-            '/fortnite/api/game/v2/grant_access/{client_id}',
-            client_id=self.client.user.id
+            '/fortnite/api/storeaccess/v1/request_access/'
+            f'{self.client.user.id}',
         )
         return await self.post(r, json={}, **kwargs)
 
@@ -1258,9 +1268,8 @@ class HTTPClient:
                                               user_id: str,
                                               offer_id: str) -> Any:
         r = FortnitePublicService(
-            '/fortnite/api/storefront/v2/gift/check_eligibility/recipient/{user_id}/offer/{offer_id}',  # noqa
-            user_id=user_id,
-            offer_id=offer_id,
+            '/fortnite/api/storefront/v2/gift/check_eligibility/'
+            f'recipient/{user_id}/offer/{offer_id}'
         )
         return await self.get(r)
 
@@ -1269,8 +1278,9 @@ class HTTPClient:
         return await self.get(r)
 
     async def fortnite_get_br_inventory(self, user_id: str) -> dict:
-        r = FortnitePublicService('/fortnite/api/game/v2/'
-                                  f'br-inventory/account/{user_id}')
+        r = FortnitePublicService(
+            f'/fortnite/api/game/v2/br-inventory/account/{user_id}'
+        )
         return await self.get(r)
 
     ###################################
@@ -1453,23 +1463,24 @@ class HTTPClient:
     ###################################
 
     async def party_disconnect(self, party_id: str, user_id: str) -> dict:
+        payload = {
+            'id': str(self.client.xmpp.local_jid)
+        }
         r = PartyService(
             'party/api/v1/Fortnite/parties/{party_id}/members/{user_id}/disconnect',  # noqa
             party_id=party_id,
             user_id=user_id,
         )
-        return await self.post(r)
+        return await self.post(r,)
 
     async def party_send_invite(self, party_id: str,
                                 user_id: str,
                                 send_ping: bool = True) -> Any:
-        conn_type = self.client.default_party_member_config.cls.CONN_TYPE
         payload = {
-            'urn:epic:cfg:build-id_s': self.client.party_build_id,
-            'urn:epic:conn:platform_s': self.client.platform.value,
-            'urn:epic:conn:type_s': conn_type,
-            'urn:epic:invite:platformdata_s': '',
+            'urn:epic:invite:platformdata_s': f'guid={uuid.uuid4().hex.upper()}',
             'urn:epic:member:dn_s': self.client.user.display_name,
+            'urn:epic:conn:platform_s': self.client.platform.value,
+            'urn:epic:cfg:build-id_s': self.client.party_build_id
         }
 
         params = {
@@ -1491,16 +1502,17 @@ class HTTPClient:
         )
         return await self.delete(r)
 
-    # NOTE: Deprecated since fortnite v11.30. Use param sendPing=True with
-    #       send_invite
-    # NOTE: Now used for sending invites from private parties
     async def party_send_ping(self, user_id: str) -> Any:
+        payload = {
+            'urn:epic:invite:platformdata_s': f'guid={uuid.uuid4().hex.upper()}',
+            'urn:epic:conn:platform_s': self.client.platform.value
+        }
         r = PartyService(
             '/party/api/v1/Fortnite/user/{user_id}/pings/{client_id}',
             user_id=user_id,
             client_id=self.client.user.id
         )
-        return await self.post(r, json={})
+        return await self.post(r, json=payload)
 
     async def party_delete_ping(self, user_id: str) -> Any:
         r = PartyService(
@@ -1555,44 +1567,20 @@ class HTTPClient:
         return await self.delete(r)
 
     async def party_leave(self, party_id: str, **kwargs: Any) -> Any:
-        conn_type = self.client.default_party_member_config.cls.CONN_TYPE
-        payload = {
-            'connection': {
-                'id': self.client.user.jid,
-                'meta': {
-                    'urn:epic:conn:platform_s': self.client.platform.value,
-                    'urn:epic:conn:type_s': conn_type,
-                },
-            },
-            'meta': {
-                'urn:epic:member:dn_s': self.client.user.display_name,
-                'urn:epic:member:type_s': conn_type,
-                'urn:epic:member:platform_s': self.client.platform.value,
-                'urn:epic:member:joinrequest_j': json.dumps({
-                    'CrossplayPreference_i': '1'
-                }),
-            }
-        }
-
         r = PartyService(
             '/party/api/v1/Fortnite/parties/{party_id}/members/{client_id}',
             party_id=party_id,
             client_id=self.client.user.id
         )
-        return await self.delete(r, json=payload, **kwargs)
+        return await self.delete(r, **kwargs)
 
-    async def party_join_request(self, party_id: str) -> Any:
-        conf = self.client.default_party_member_config
-        conn_type = conf.cls.CONN_TYPE
+    async def party_join_request(self, party_id: str, user_id: str) -> Any:
         payload = {
             'connection': {
-                'id': str(self.client.xmpp.xmpp_client.local_jid),
+                'id': str(self.client.xmpp.local_jid),
                 'meta': {
-                    'urn:epic:conn:platform_s': self.client.platform.value,
-                    'urn:epic:conn:type_s': conn_type,
-                },
-                'yield_leadership': conf.yield_leadership,
-                'offline_ttl': conf.offline_ttl,
+                    'urn:epic:conn:platform_s': self.client.platform.value
+                }
             },
             'meta': {
                 'urn:epic:member:dn_s': self.client.user.display_name,
@@ -1605,6 +1593,7 @@ class HTTPClient:
                             'data': json.dumps({
                                 'CrossplayPreference': '1',
                                 'SubGame_u': '1',
+                                'TargetUserId_s': user_id
                             })
                         }
                     ]
@@ -1622,7 +1611,7 @@ class HTTPClient:
 
     async def party_send_intention(self, user_id: str) -> dict:
         payload = {
-            'urn:epic:invite:platformdata_s': '',
+            'urn:epic:invite:platformdata_s': f'RequestToJoin,guid={uuid.uuid4().hex.upper()}',
         }
 
         r = PartyService(
@@ -1652,26 +1641,25 @@ class HTTPClient:
         return await self.get(r)
 
     async def party_create(self, config: dict, **kwargs: Any) -> dict:
-        conf = self.client.default_party_member_config
-        conn_type = conf.cls.CONN_TYPE
 
         _chat_enabled = str(config['chat_enabled']).lower()
         payload = {
             'config': {
+                'discoverability': config['discoverability'],
                 'join_confirmation': config['join_confirmation'],
                 'joinability': config['joinability'],
                 'max_size': config['max_size']
             },
             'join_info': {
                 'connection': {
-                    'id': str(self.client.xmpp.xmpp_client.local_jid),
+                    'id': str(self.client.xmpp.local_jid),
                     'meta': {
-                        'urn:epic:conn:platform_s': self.client.platform.value,
-                        'urn:epic:conn:type_s': conn_type
-                    },
-                    'yield_leadership': conf.yield_leadership,
-                    'offline_ttl': conf.offline_ttl,
+                        'urn:epic:conn:platform_s': self.client.platform.value
+                    }
                 },
+                'meta': {
+                    'urn:epic:member:dn_s': self.client.user.display_name
+                }
             },
             'meta': {
                 'urn:epic:cfg:accepting-members_b': False,
@@ -1682,7 +1670,7 @@ class HTTPClient:
                 'urn:epic:cfg:join-request-action_s': 'Manual',
                 'urn:epic:cfg:not-accepting-members-reason_i': 0,
                 'urn:epic:cfg:party-type-id_s': 'default',
-                'urn:epic:cfg:presence-perm_s': 'Noone',
+                'urn:epic:cfg:presence-perm_s': 'Noone'
             }
         }
 
@@ -1693,15 +1681,12 @@ class HTTPClient:
                                        user_id: str,
                                        updated_meta: dict,
                                        deleted_meta: list,
-                                       overridden_meta: dict,
                                        revision: int,
-                                       override: dict = {},
                                        **kwargs: Any) -> Any:
         payload = {
             'delete': deleted_meta,
-            'update': updated_meta,
-            'override': overridden_meta,
             'revision': revision,
+            'update': updated_meta
         }
 
         r = PartyService(
@@ -1715,15 +1700,13 @@ class HTTPClient:
     async def party_update_meta(self, party_id: str,
                                 updated_meta: dict,
                                 deleted_meta: list,
-                                overridden_meta: dict,
                                 revision: int,
                                 config: dict = {},
                                 **kwargs: Any) -> Any:
         payload = {
             'meta': {
                 'delete': deleted_meta,
-                'update': updated_meta,
-                'override': overridden_meta
+                'update': updated_meta
             },
             'revision': revision,
         }
@@ -1752,7 +1735,7 @@ class HTTPClient:
         r = HabaneroService(f'/api/v1/games/fortnite/trackprogress/{user_id}')
         return await self.get(r)
 
-    async def get_active_tracks(self, time: datetime.datetime = datetime.datetime.now()) -> list:
+    async def get_active_tracks(self, time: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)) -> list:
         r = HabaneroService(f'/api/v1/games/fortnite/tracks/activeBy/{to_iso(time)}')
         return await self.get(r)
 
@@ -1760,8 +1743,16 @@ class HTTPClient:
     #          Chat Service           #
     ###################################
 
-    async def account_chat_oauth_grant(self, **kwargs: Any) -> Any:
+    async def eas_token_oauth_grant(self, **kwargs: Any) -> Any:
         r = ChatService('/epic/oauth/v2/token')
+        return await self.post(r, **kwargs)
+    
+    async def eos_token_oauth_grant(self, **kwargs: Any) -> Any:
+        r = ChatService('/auth/v1/oauth/token')
+        return await self.post(r, **kwargs)
+    
+    async def eos_token_oauth_continuation(self, **kwargs: Any) -> Any:
+        r = ChatService('/auth/v1/users')
         return await self.post(r, **kwargs)
 
     async def chat_send_presence(self,
@@ -1791,24 +1782,109 @@ class HTTPClient:
                         f'{self.client.user.id}/presence/{connection_id}')
         return await self.patch(r, json=payload, **kwargs)
 
-    async def friend_send_message(self, user_id: str, content: str) -> Any:
-        if len(content) >= 2048:
-            raise ChatError("Message body exceeds max length of 2048")
-
+    async def chat_get_conversation_data(self,
+                                         user_id: str
+                                         ) -> str:
         payload = {
-            "message": {
-                "body": content
-            }
+            "title": "",
+            "type": "dm",
+            "members": [
+                self.client.user.id,
+                user_id
+            ]
         }
 
         r = ChatService(
-            '/epic/chat/v1/public/{deployment_id}'
-            '/whisper/{client_id}/{user_id}',
-            deployment_id=self.client.deployment_id,
-            client_id=self.client.user.id,
-            user_id=user_id
+            '/epic/chat/v1/public/_/conversations?createIfExists=false'
         )
-        return await self.post(r, json=payload)
+        return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
+
+    async def chat_get_previous_messages(self,
+                                         conversation_id: str
+                                         ) -> str:
+        r = ChatService(
+            f'/epic/chat/v1/public/_/conversations/{conversation_id}'
+            f'/messages?requestingAccountId={self.client.user.id}&limit=30'
+        )
+        data = await self.get(r, auth="EAS_ACCESS_TOKEN")
+        return data.get("page", [])
+
+    async def friend_send_message(self,
+                                  user_id: str,
+                                  content: str,
+                                  retry_on_fail: bool = True
+                                  ) -> dict:
+        if len(content) >= 2048:
+            raise ChatError("Message body exceeds max length of 2048")
+
+        friend = self.client.get_friend(user_id)
+        if friend is None:
+            try:
+                friend = await self.client.wait_for(
+                    'friend_add',
+                    check=lambda f: f.id == user_id,
+                    timeout=1
+                )
+            except asyncio.TimeoutError:
+                raise ChatError(
+                    f"Tried to send message to non-friend {user_id}"
+                )
+
+        if not friend._conversation_id or friend._is_reportable is None:
+            conversation_data = await self.chat_get_conversation_data(
+                user_id=user_id
+            )
+            friend._conversation_id = conversation_data.get('conversationId')
+            friend._is_reportable   = conversation_data.get('isReportable')
+
+        body, signature = self.client.create_signed_message(
+            conversation_id=friend._conversation_id,
+            content=content,
+            sequence=0
+        )
+
+        payload = {
+            "allowedRecipients": [
+                user_id,
+                self.client.user.id
+            ],
+            "message": {
+                "body": body
+            },
+            "isReportable": friend._is_reportable,
+            "metadata": {
+                "TmV": "2",
+                "Pub": self.client.key_data.get("jwt"),
+                "Sig": signature,
+                "PlfNm": "WIN",
+                "PlfId": self.client.user.id,
+            },
+        }
+
+        r = ChatService(
+            '/epic/chat/v1/public/_/conversations/{conversation_id}/'
+            'messages?fromAccountId={client_id}',
+            conversation_id=friend._conversation_id,
+            client_id=self.client.user.id
+        )
+
+        try:
+            return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
+        except HTTPException as exc:
+            if (
+                retry_on_fail
+                and exc.message_code
+                == "errors.com.epicgames.social.chat.is_reportable_mismatch"
+            ):
+                friend._is_reportable = None
+
+                return await self.friend_send_message(
+                    user_id=user_id,
+                    content=content,
+                    retry_on_fail=False
+                )
+
+            raise exc
 
     async def party_send_message(self, content: str) -> Any:
         if len(content) >= 2048:
@@ -1817,19 +1893,80 @@ class HTTPClient:
         if self.client.party.member_count == 1:
             raise ChatError("Client is in a party alone.")
 
+        body, signature = self.client.create_signed_message(
+            conversation_id=self.client.party.id,
+            content=content,
+            type="Party"
+        )
+
         payload = {
-            "allowedRecipients": [member.id for member in
-                                  self.client.party.members],
+            "allowedRecipients": [
+                member.id for member in self.client.party.members
+                if member.id != self.client.user.id
+            ],
             "message": {
-                "body": content
-            }
+                "body": body
+            },
+            "isReportable": False,
+            "metadata": {
+                "TmV": "2",
+                "Pub": self.client.key_data.get("jwt"),
+                "Sig": signature,
+                "NPM": "1",
+                "PlfNm": "WIN",
+                "PlfId": self.client.user.id,
+            },
         }
 
         r = ChatService(
-            '/epic/chat/v1/public/{deployment_id}'
-            '/conversations/p-{party_id}/messages?fromAccountId={client_id}',
+            '/epic/chat/v1/public/{deployment_id}/conversations/'
+            '{conversation_id}/messages?fromAccountId={client_id}',
             deployment_id=self.client.deployment_id,
-            party_id=self.client.party.id,
-            client_id=self.client.user.id,
+            conversation_id=f'p-{self.client.party.id}',
+            client_id=self.client.user.id
         )
+        return await self.post(r, json=payload, auth="EAS_ACCESS_TOKEN")
+
+    ###################################
+    #       Public Key Service        #
+    ###################################
+
+    async def register_public_key(self, public_key: str) -> dict:
+        payload = {
+            "key": public_key,
+            "algorithm": "ed25519"
+        }
+
+        r = PublicKeyService('/publickey/v2/publickey/')
         return await self.post(r, json=payload)
+
+    ###################################
+    #         Events Service          #
+    ###################################
+
+    async def events_get_tokens(self, account_ids: list) -> dict:
+        params = {
+            'teamAccountIds': ','.join(account_ids)
+        }
+
+        r = EventsPublicService('/api/v1/players/Fortnite/tokens')
+        data = await self.get(r, params=params)
+        return {
+            user["accountId"]: user["tokens"] for user in data["accounts"]
+        }
+
+    ###################################
+    #        Launcher Service         #
+    ###################################
+
+    async def launcher_get_build(self, platform: str, **kwargs: Any) -> str:
+        params = {
+            'label': 'Live'
+        }
+
+        r = LauncherPublicService(
+            f'/launcher/api/public/assets/{platform}/'
+            '5cb97847cee34581afdbc445400e2f77/FortniteContentBuilds'
+        )
+        data = await self.get(r, params=params, **kwargs)
+        return data.get('buildVersion')

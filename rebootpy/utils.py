@@ -27,6 +27,8 @@ SOFTWARE.
 import asyncio
 import datetime
 import re
+import copy
+import json
 
 from typing import Optional
 
@@ -95,12 +97,14 @@ def from_iso(iso: str) -> datetime.datetime:
     :class:`datetime.datetime`
     """
     if isinstance(iso, datetime.datetime):
-        return iso
+        return iso if iso.tzinfo else iso.replace(tzinfo=datetime.timezone.utc)
 
     try:
-        return datetime.datetime.strptime(iso, '%Y-%m-%dT%H:%M:%S.%fZ')
+        dt = datetime.datetime.strptime(iso, '%Y-%m-%dT%H:%M:%S.%fZ')
     except ValueError:
-        return datetime.datetime.strptime(iso, '%Y-%m-%dT%H:%M:%SZ')
+        dt = datetime.datetime.strptime(iso, '%Y-%m-%dT%H:%M:%SZ')
+
+    return dt.replace(tzinfo=datetime.timezone.utc)
 
 
 def to_iso(dt: datetime.datetime) -> str:
@@ -153,3 +157,32 @@ def is_display_name(value: str) -> bool:
         ``True`` if string is valid else ``False``
     """
     return isinstance(value, str) and 3 <= len(value) <= 16
+
+
+def recursive_decode(value: dict) -> dict:
+    """Simple function to recursively decode all JSON string dictionary values.
+
+    Parameters
+    ----------
+    dict: :class:`dict`
+        The dictionary you want to recursively decode all JSON values.
+
+    Returns
+    -------
+    :class:`dict`
+        Copy of the original dict with all JSON values decoded.
+    """
+    duplicate = copy.deepcopy(value)
+
+    for key, value in duplicate.items():
+        if isinstance(value, str) and value.strip().startswith(('{', '[')) and value.strip().endswith(('}', ']')):
+            duplicate[key] = json.loads(value)
+        if isinstance(duplicate[key], dict):
+            duplicate[key] = recursive_decode(duplicate[key])
+        if isinstance(duplicate[key], list):
+            duplicate[key] = [
+                recursive_decode(item) if isinstance(item, dict) else item
+                for item in duplicate[key]
+            ]
+
+    return duplicate

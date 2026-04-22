@@ -24,7 +24,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-import aioxmpp
 import asyncio
 import json
 import logging
@@ -33,13 +32,14 @@ import uuid
 import itertools
 import unicodedata
 import aiohttp
+import base64
 
 from xml.etree import ElementTree
 from collections import defaultdict
 from typing import TYPE_CHECKING, Optional, Union, Awaitable, Any, Tuple
 from .errors import HTTPException
 from .party import (Party, PartyJoinRequest, ReceivedPartyInvitation,
-                    PartyJoinConfirmation, PlaylistRequest)
+                    PartyJoinConfirmation)
 from .presence import Presence
 from .enums import AwayStatus
 from .utils import to_iso, from_iso
@@ -55,11 +55,13 @@ _party_meta_attrs = {'playlist_info': 'playlist', 'squad_fill': None,
 _member_meta_attrs = ('ready', 'input', 'outfit',
                       'backpack', 'pet', 'pickaxe', 'contrail', 'emote',
                       'emoji', 'banner', 'battlepass_info', 'in_match',
-                      'match_players_left', 'enlightenments', 'corruption',
+                      'match_players_left', 'enlightenments',
                       'outfit_variants', 'backpack_variants',
                       'pickaxe_variants', 'contrail_variants',
                       'lobby_map_marker_is_visible',
-                      'lobby_map_marker_coordinates',)
+                      'lobby_map_marker_coordinates', 'playlist_selection',
+                      'matchmaking_info', 'sidekick', 'sidekick_variants',
+                      'jam',)
 
 
 def is_RandALCat(c: str) -> bool:
@@ -231,381 +233,53 @@ class XMLProcessor:
         return False
 
 
-class WebsocketTransport:
-    def __init__(self, stream: 'WebsocketXMLStream',
-                 client: 'Client',
-                 logger: logging.Logger,
-                 ws_connector: Optional[aiohttp.BaseConnector] = None) -> None:
-        self.stream = stream
-        self.client = client
-        self.logger = logger
-        self.ws_connector = ws_connector
-
-        self.xml_processor = XMLProcessor()
-
-        self.connection = None
-        self._buffer = b''
-        self._reader_task = None
-        self._close_event = asyncio.Event()
-        self._called_lost = False
-        self._attempt_reconnect = True
-
-    async def create_connection(self, *args,
-                                **kwargs) -> aiohttp.ClientWebSocketResponse:
-        self.logger.debug('Setting up new websocket connection.')
-
-        self.session = aiohttp.ClientSession(
-            connector=self.ws_connector,
-            connector_owner=self.ws_connector is None,
-        )
-        self.connection = con = await self.session.ws_connect(
-            *args, **kwargs
-        )
-
-        asyncio.create_task(self.reader())
-        self.stream.connection_made(self)
-        self._called_lost = False
-        self._attempt_reconnect = True
-
-        self.logger.debug('Websocket connection established.')
-        return con
-
-    async def reader(self) -> None:
-        self.logger.debug('Websocket reader is now running.')
-
-        try:
-            while True:
-                msg = await self.connection.receive()
-
-                self.logger.debug('RECV: {0}'.format(msg))
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    ret = self.xml_processor.process(msg.data)
-                    if ret is None:
-                        continue
-                    elif ret is False:
-                        self.stream.data_received(msg.data)
-                    else:
-                        type_ = ret[0]
-                        if type_ == 'presence':
-                            EventDispatcher.process_presence(
-                                self.client,
-                                *ret[1]
-                            )
-                        elif type_ == 'message':
-                            EventDispatcher.process_event(
-                                self.client,
-                                *ret[1]
-                            )
-
-                if msg.type == aiohttp.WSMsgType.CLOSED:
-                    if self._attempt_reconnect:
-                        err = ConnectionError(
-                            'websocket stream closed'
-                        )
-                    else:
-                        err = None
-
-                    if not self._called_lost:
-                        self._called_lost = True
-                        self.stream.connection_lost(err)
-                        self._close_session()
-
-                    break
-
-                if msg.type == aiohttp.WSMsgType.ERROR:
-                    if not self._called_lost:
-                        self._called_lost = True
-                        self.stream.connection_lost(
-                            ConnectionError(
-                                'websocket stream received an error: '
-                                '{0}'.format(self.connection.exception()))
-                        )
-                    break
-        finally:
-            self.logger.debug('Websocket reader stopped.')
-
-    async def send(self, data: bytes) -> None:
-        self.logger.debug('SEND: {0}'.format(data))
-        await self.connection.send_bytes(data)
-
-    def write(self, data: bytes) -> None:
-        self._buffer += data
-
-    def flush(self) -> None:
-        if self._buffer:
-            asyncio.ensure_future(self.send(self._buffer))
-
-        self._buffer = b''
-
-    def can_write_eof(self) -> bool:
-        return False
-
-    def write_eof(self) -> None:
-        raise NotImplementedError("Cannot write_eof() on ws transport.")
-
-    def _stop_reader(self) -> None:
-        if self._reader_task is not None and not self._reader_task.cancelled():
-            self._reader_task.cancel()
-
-    def _close_session(self) -> None:
-        try:
-            return asyncio.create_task(self.session.close())
-        except AttributeError:
-            pass
-
-    def close_callback(self, *args) -> None:
-        self._close_event.set()
-
-    def on_close(self, *args) -> None:
-        task = self._close_session()
-        if task is not None:
-            task.add_done_callback(self.close_callback)
-
-    def _close(self) -> None:
-        if not self.connection:
-            raise RuntimeError('Cannot close a non-existing connection.')
-
-        self.logger.debug('Closing websocket connection.')
-
-        task = asyncio.create_task(self.connection.close())
-        task.add_done_callback(self.on_close)
-
-        self._stop_reader()
-
-    def close(self) -> None:
-        self._attempt_reconnect = False
-        self._close()
-
-    def abort(self) -> None:
-        self.logger.debug('Received abort signal.')
-        self._close()
-
-    async def wait_closed(self) -> None:
-        await self._close_event
-
-    def get_extra_info(self, *args, **kwargs) -> Any:
-        return self.connection.get_extra_info(*args, **kwargs)
-
-
-class WebsocketXMLStreamWriter(aioxmpp.xml.XMLStreamWriter):
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._writer.endElementNS(
-            (aioxmpp.utils.namespaces.xmlstream, "stream"),
-            None
-        )
-        for prefix in self._nsmap_to_use:
-            self._writer.endPrefixMapping(prefix)
-        self._writer.endDocument()
-        self._writer.flush()
-        del self._writer
-
-
-class WebsocketXMLStream(aioxmpp.protocol.XMLStream):
-    def _reset_state(self) -> None:
-        self._kill_state()
-
-        self._processor = aioxmpp.xml.XMPPXMLProcessor()
-        self._processor.stanza_parser = self.stanza_parser
-        self._processor.on_stream_header = self._rx_stream_header
-        self._processor.on_stream_footer = self._rx_stream_footer
-        self._processor.on_exception = self._rx_exception
-        self._parser = aioxmpp.xml.make_parser()
-        self._parser.setContentHandler(self._processor)
-        self._debug_wrapper = None
-
-        if self._logger.getEffectiveLevel() <= logging.DEBUG:
-            dest = aioxmpp.protocol.DebugWrapper(self._transport, self._logger)
-            self._debug_wrapper = dest
-        else:
-            dest = self._transport
-
-        self._writer = WebsocketXMLStreamWriter(
-            dest,
-            self._to,
-            nsmap={None: "jabber:client"},
-            sorted_attributes=self._sorted_attributes)
-
-    def error_future(self) -> asyncio.Future:
-        def callback(*args):
-            future = args[0]
-
-            try:
-                future.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
-        fut = super().error_future()
-        fut.add_done_callback(callback)
-        return fut
-
-
-class XMPPOverWebsocketConnector(aioxmpp.connector.BaseConnector):
-    def __init__(self, client, ws_connector=None):
-        self.client = client
-        self.ws_connector = ws_connector
-
-    @property
-    def tls_supported(self) -> bool:
-        return False
-
-    @property
-    def dane_supported(self) -> bool:
-        return False
-
-    async def connect(self, loop: asyncio.AbstractEventLoop,
-                      metadata: aioxmpp.security_layer.SecurityLayer,
-                      domain: str,
-                      host: str,
-                      port: int,
-                      negotiation_timeout: Union[int, float],
-                      base_logger: Optional[logging.Logger] = None
-                      ) -> Tuple[WebsocketTransport,
-                                 WebsocketXMLStream,
-                                 aioxmpp.nonza.StreamFeatures]:
-        features_future = asyncio.Future()
-
-        stream = WebsocketXMLStream(
-            to=domain,
-            features_future=features_future,
-            base_logger=base_logger,
-        )
-
-        if base_logger is not None:
-            logger = base_logger.getChild(type(self).__name__)
-        else:
-            logger = logging.getLogger(".".join([
-                __name__, type(self).__qualname__,
-            ]))
-
-        transport = WebsocketTransport(
-            stream,
-            self.client,
-            logger,
-            ws_connector=self.ws_connector
-        )
-        await transport.create_connection(
-            'wss://{host}'.format(host=host),
-            protocols=('xmpp',),
-            timeout=10,
-        )
-
-        return transport, stream, await features_future
-
-
-# Suppress noisy log message on stream failure
-async def _patched_main_impl(self):
-    failure_future = self._failure_future
-
-    override_peer = []
-    if self.stream.sm_enabled:
-        sm_location = self.stream.sm_location
-        if sm_location:
-            override_peer.append((
-                str(sm_location[0]),
-                sm_location[1],
-                aioxmpp.connector.STARTTLSConnector(),
-            ))
-    override_peer += self.override_peer
-
-    _, xmlstream, features = await aioxmpp.node.connect_xmlstream(
-        self._local_jid,
-        self._security_layer,
-        negotiation_timeout=self.negotiation_timeout.total_seconds(),
-        override_peer=override_peer,
-        logger=self.logger
-    )
-
-    self._had_connection = True
-
-    try:
-        features, _ = await self._negotiate_stream(
-            xmlstream,
-            features
-        )
-
-        if self._is_suspended:
-            self.on_stream_resumed()
-        self._is_suspended = False
-        self._backoff_time = None
-
-        exc = await failure_future
-        # self.logger.error("stream failed: %s", exc)
-        self.logger.debug("stream failed: %s", exc)
-        raise exc
-    except asyncio.CancelledError:
-        self.logger.info("client shutting down (on request)")
-        # cancelled, this means a clean shutdown is requested
-        await self.stream.close()
-        raise
-    finally:
-        self.logger.info("stopping stream")
-        self.stream.stop()
-
-
-# Were just patching this method to suppress an exception
-# which is raised on stream error.
-def _patched_done_handler(self, task):
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        pass
-    except Exception as err:
-        try:
-            if self._sm_enabled:
-                self._xmlstream.abort()
-            else:
-                self._xmlstream.close()
-        except Exception:
-            pass
-        self.on_failure(err)
-        # self._logger.exception("broker task failed")
-
-
-aioxmpp.node.Client._main_impl = _patched_main_impl
-aioxmpp.stream.StanzaStream._done_handler = _patched_done_handler
-
-
 class XMPPClient:
     def __init__(self, client: 'Client', ws_connector=None) -> None:
         self.client = client
-        self.ws_connector = ws_connector
-
-        self.xmpp_client = None
-        self.stream = None
+        # self.ws_connector = ws_connector
+        #
+        # self.xmpp_client = None
+        # self.stream = None
 
         self._ping_task = None
+        self._presence_task = None
+        self._watchdog_task = None
         self._is_suspended = False
         self._reconnect_recover_task = None
         self._last_disconnected_at = None
         self._last_known_party_id = None
-        self._task = None
+        self._xmpp_task = None
 
         self.send_presence_on_add = True
 
-    def jid(self, user_id: str) -> aioxmpp.JID:
-        return aioxmpp.JID.fromstr('{}@{}'.format(
-            user_id,
-            self.client.service_host
-        ))
+        # new attributes
+        self.http_session = None
+        self.websocket = None
 
-    def _remove_illegal_characters(self, chars: str) -> str:
-        fixed = []
-        for c in chars:
-            try:
-                aioxmpp.stringprep.resourceprep(c)
-            except ValueError:
-                continue
+        self._authed = False
+        self._bound = False
+        self._ready = False
+        self._connected = False
+        self._restarting = False
+        self._last_pong = None
+        self._xmpp_ready_event = asyncio.Event()
 
-            if is_RandALCat(c):
-                continue
+        self.resource_hex = uuid.uuid4().hex.upper()
 
-            fixed.append(c)
-        return ''.join(fixed)
+        self.xml_processor = XMLProcessor()
+
+        self.stanza = "<presence/>"
+
+    @property
+    def resource(self) -> str:
+        return f"V2:Fortnite:{self.client.platform.value}::{self.resource_hex}"
+
+    @property
+    def local_jid(self) -> str:
+        return f"{self.client.user.id}@prod.ol.epicgames.com/{self.resource}"
+
+    def _jid(self, user_id: str) -> str:
+        return f"{user_id}@{self.client.service_host}"
 
     def _create_invite(self, from_id: str, data: dict) -> dict:
         sent_at = from_iso(data['sent'])
@@ -1138,11 +812,6 @@ class XMPPClient:
                     value
                 )
 
-        if self.client.auto_update_status and \
-                (_getattr(party, 'playlist_info')[0]
-                 != pre_values['playlist_info'][0]):
-            await self.client.auto_update_status_text()
-
     @EventDispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_STATE_UPDATED')  # noqa
     async def event_party_member_state_updated(self,
                                                ctx: EventContext) -> None:
@@ -1249,28 +918,6 @@ class XMPPClient:
                     except KeyError:
                         pass
 
-        if (body.get('member_state_updated').get('Default:SuggestedIsland_j')
-                and party.me.leader):
-            island_raw = json.loads(
-                body['member_state_updated']['Default:SuggestedIsland_j']
-            )
-
-            if island_raw['SuggestedIsland']['linkId']['mnemonic']:
-                request = PlaylistRequest(
-                    client=self.client,
-                    party=party,
-                    member=member,
-                    raw_suggestion=island_raw['SuggestedIsland']
-                )
-
-                if not self.client._event_has_destination(
-                    'party_playlist_request'
-                ):
-                    await request.accept()
-                else:
-                    self.client.dispatch_event('party_playlist_request',
-                                               request)
-
         self.client.dispatch_event('party_member_update', member)
 
         # Only dispatch the events below if the update is not the initial
@@ -1280,7 +927,7 @@ class XMPPClient:
 
         def _dispatch(key, member, pre_value, value):
             self.client.dispatch_event(
-                'party_member_{0}_change'.format(key),
+                f'party_member_{key}_change',
                 member,
                 pre_value,
                 value
@@ -1301,6 +948,19 @@ class XMPPClient:
             value = _getattr(member, key)
             if not compare(pre_value, value):
                 _dispatch(key, member, pre_value, value)
+
+                if key == 'playlist_selection':
+                    self.client.dispatch_event(
+                        'party_playlist_change',
+                        self.client.party,
+                        (pre_value, ''),
+                        (value, '')
+                    )
+
+                    if self.client.auto_update_status:
+                        self.client.loop.create_task(
+                            self.client.auto_update_status_text()
+                        )
 
     @EventDispatcher.event('com.epicgames.social.party.notification.v0.MEMBER_REQUIRE_CONFIRMATION')  # noqa
     async def event_party_member_require_confirmation(self,
@@ -1442,201 +1102,365 @@ class XMPPClient:
 
         self.client.dispatch_event('friend_presence', before_pres, _pres)
 
-    def on_stream_established(self) -> None:
-        self.client.dispatch_event('xmpp_session_establish')
+    # def on_stream_established(self) -> None:
+    #     self.client.dispatch_event('xmpp_session_establish')
+    #
+    #     async def on_establish():
+    #         # Just incase the recover task hangs we don't want it
+    #         # running forever in the background until a new close is
+    #         # dispatched potentially fucking shit up big time.
+    #         task = self._reconnect_recover_task
+    #         if task is not None and not task.done():
+    #             try:
+    #                 await asyncio.wait_for(task, timeout=20)
+    #             except asyncio.TimeoutError:
+    #                 pass
+    #
+    #     async def run_reconnect():
+    #         now = datetime.datetime.utcnow()
+    #         secs = (now - self._last_disconnected_at).total_seconds()
+    #         if secs >= self.client.default_party_member_config.offline_ttl:
+    #             return await self.client._create_party()
+    #
+    #         await self.client._reconnect_to_party()
+    #
+    #     if self._is_suspended:
+    #         self.client.dispatch_event('xmpp_session_reconnect')
+    #         self.client.loop.create_task(run_reconnect())
+    #
+    #     self._is_suspended = False
+    #     self.client.loop.create_task(on_establish())
+    #
+    # def on_stream_suspended(self, reason: Optional[Exception]) -> None:
+    #     jid = self.xmpp_client.local_jid
+    #     resource = jid.resource[:-32] + (uuid.uuid4().hex).upper()
+    #     self.xmpp_client._local_jid = jid.replace(resource=resource)
+    #
+    #     def on_events_recovered(*args):
+    #         self._reconnect_recover_task = None
+    #
+    #     self._reconnect_recover_task = task = self.client.loop.create_task(
+    #         self.client.recover_events(
+    #             refresh_caches=True,
+    #             wait_for_close=False
+    #         )
+    #     )
+    #     task.add_done_callback(on_events_recovered)
+    #
+    #     if self.client.party is not None:
+    #         self._last_known_party_id = self.client.party.id
+    #
+    #     self._is_suspended = True
+    #     self.client.dispatch_event('xmpp_session_lost')
+    #
+    # def on_stream_destroyed(self, reason: Optional[Exception] = None) -> None:
+    #     if not self._is_suspended:
+    #         task = self._reconnect_recover_task
+    #         if task is not None and not task.cancelled():
+    #             task.cancel()
+    #
+    #     self._last_disconnected_at = datetime.datetime.utcnow()
+    #     self.client.dispatch_event('xmpp_session_close')
+    #
+    # def setup_callbacks(self) -> None:
+    #     client = self.xmpp_client
+    #
+    #     client.on_stream_established.connect(self.on_stream_established)
+    #     client.on_stream_suspended.connect(self.on_stream_suspended)
+    #     client.on_stream_destroyed.connect(self.on_stream_destroyed)
 
-        async def on_establish():
-            # Just incase the recover task hangs we don't want it
-            # running forever in the background until a new close is
-            # dispatched potentially fucking shit up big time.
-            task = self._reconnect_recover_task
-            if task is not None and not task.done():
-                try:
-                    await asyncio.wait_for(task, timeout=20)
-                except asyncio.TimeoutError:
-                    pass
+    async def ping_watchdog(self) -> None:
+        while self._connected:
+            log.debug(f'last pong: {self._last_pong}')
+            if (
+                self._last_pong is not None and
+                datetime.datetime.now(datetime.timezone.utc) - self._last_pong
+                > datetime.timedelta(seconds=20)
+            ):
+                log.debug(
+                    'No ping response in 20 second, '
+                    'assuming dead connection and restarting.'
+                )
+                await self.restart()
 
-        async def run_reconnect():
-            now = datetime.datetime.utcnow()
-            secs = (now - self._last_disconnected_at).total_seconds()
-            if secs >= self.client.default_party_member_config.offline_ttl:
-                return await self.client._create_party()
+            await asyncio.sleep(5)
 
-            await self.client._reconnect_to_party()
+    async def xmpp_send(self, data: str) -> None:
+        if self.websocket.closed:
+            raise ConnectionError("Attempted to write to closed websocket.")
 
-        if self._is_suspended:
-            self.client.dispatch_event('xmpp_session_reconnect')
-            self.client.loop.create_task(run_reconnect())
-
-        self._is_suspended = False
-        self.client.loop.create_task(on_establish())
-
-    def on_stream_suspended(self, reason: Optional[Exception]) -> None:
-        jid = self.xmpp_client.local_jid
-        resource = jid.resource[:-32] + (uuid.uuid4().hex).upper()
-        self.xmpp_client._local_jid = jid.replace(resource=resource)
-
-        def on_events_recovered(*args):
-            self._reconnect_recover_task = None
-
-        self._reconnect_recover_task = task = self.client.loop.create_task(
-            self.client.recover_events(
-                refresh_caches=True,
-                wait_for_close=False
+        try:
+            await asyncio.wait_for(
+                self.websocket.send_str(data),
+                timeout=5.0
             )
-        )
-        task.add_done_callback(on_events_recovered)
-
-        if self.client.party is not None:
-            self._last_known_party_id = self.client.party.id
-
-        self._is_suspended = True
-        self.client.dispatch_event('xmpp_session_lost')
-
-    def on_stream_destroyed(self, reason: Optional[Exception] = None) -> None:
-        if not self._is_suspended:
-            task = self._reconnect_recover_task
-            if task is not None and not task.cancelled():
-                task.cancel()
-
-        self._last_disconnected_at = datetime.datetime.utcnow()
-        self.client.dispatch_event('xmpp_session_close')
-
-    def setup_callbacks(self) -> None:
-        client = self.xmpp_client
-
-        client.on_stream_established.connect(self.on_stream_established)
-        client.on_stream_suspended.connect(self.on_stream_suspended)
-        client.on_stream_destroyed.connect(self.on_stream_destroyed)
+        except asyncio.TimeoutError:
+            log.debug('XMPP send timed out, restarting now...')
+            await self.restart()
+        except aiohttp.client_exceptions.ClientConnectionResetError:
+            log.debug('Disconnected from websocket, restarting now...')
+            await self.restart()
+        except Exception as e:
+            log.debug(f'Unknown XMPP send error: {e}')
+            raise
 
     async def loop_ping(self) -> None:
-        while True:
-            await asyncio.sleep(60)
-            iq = aioxmpp.IQ(
-                type_=aioxmpp.IQType.GET,
-                payload=aioxmpp.ping.Ping(),
-                to=None,
+        while self._connected:
+            log.debug('Sending XMPP ping')
+            await self.xmpp_send(
+                "<iq type='get' id='ping'><ping xmlns='urn:xmpp:ping'/></iq>"
             )
-            await self.stream.send(iq)
+            log.debug('Sent XMPP ping')
+            await asyncio.sleep(10)
 
-    async def _run(self, future: asyncio.Future) -> None:
-        async with self.xmpp_client.connected() as stream:
-            self.stream = stream
-            stream.soft_timeout = datetime.timedelta(minutes=3)
-            stream.round_trip_time = datetime.timedelta(minutes=3)
-            future.set_result(None)
+    async def parse_message(self, raw: str) -> None:
+        if '<presence' not in raw:
+            log.debug(f'Received websocket message - {raw}')
 
-            # Keep connection alive by awaiting a future that will
-            # never receive a result.
-            await self.client.loop.create_future()
+        if "<stream:features" in raw and not self._authed:
+            sasl_msg = base64.b64encode(
+                f"\x00{self.client.user.id}\x00{self.client.auth.ios_access_token}".encode()
+            ).decode()
+
+            await self.xmpp_send(
+                f"<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>{sasl_msg}</auth>"
+            )
+
+        elif "<success" in raw:
+            self._authed = True
+            self.client.dispatch_event('xmpp_session_establish')
+
+            await self.xmpp_send(
+                "<open xmlns='urn:ietf:params:xml:ns:xmpp-framing' to='prod.ol.epicgames.com' version='1.0' />"
+            )
+
+        elif raw.startswith("<stream:features") and "xmpp-bind" in raw:
+            self._bound = True
+            await self.xmpp_send(
+                f"<iq type='set' id='bind_1'>"
+                f"<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>"
+                f"<resource>{self.resource}</resource>"
+                f"</bind></iq>"
+            )
+        elif 'type="result"' in raw and 'id="bind_1"' in raw:
+            await self.xmpp_send(
+                "<iq type='set' id='sess_1'><session xmlns='urn:ietf:params:xml:ns:xmpp-session'/></iq>"
+            )
+            self._ping_task = self.client.loop.create_task(self.loop_ping())
+            self._watchdog_task = self.client.loop.create_task(
+                self.ping_watchdog()
+            )
+            self._presence_task = self.client.loop.create_task(
+                self.presence_manager()
+            )
+
+            self._ready = True
+            self._xmpp_ready_event.set()
+        elif 'type="result"' in raw and 'id="ping"' in raw:
+            self._last_pong = datetime.datetime.now(datetime.timezone.utc)
+            self.client.dispatch_event('internal_xmpp_session_pong')
+            log.debug(f'Received XMPP pong')
+        else:
+            ret = self.xml_processor.process(raw)
+
+            if ret is None:
+                return
+            elif ret is False:
+                # aioxmpp used self.stream.data_received(msg.data)
+                # now nothing to feed here, so just ignore gracefully
+                return
+            else:
+                type_ = ret[0]
+                if type_ == "presence":
+                    EventDispatcher.process_presence(self.client, *ret[1])
+                elif type_ == "message":
+                    EventDispatcher.process_event(self.client, *ret[1])
+                else:
+                    log(f"Unhandled XML type: {type_}")
+
+    async def presence_manager(self) -> None:
+        stanza = ""
+        while self._connected:
+            if self.stanza != stanza:
+                await self.xmpp_send(self.stanza)
+                stanza = self.stanza
+            await asyncio.sleep(1)
+
+    async def connect_to_xmpp(self) -> None:
+        log.debug('Attempting to connect to XMPP...')
+        while True:
+            try:
+                async with self.http_session.ws_connect(
+                    "wss://xmpp-service-prod.ol.epicgames.com",
+                    headers={
+                        "Authorization": f"Bearer {self.client.auth.ios_access_token}",
+                        "Sec-WebSocket-Protocol": "xmpp"
+                    },
+                ) as websocket:
+                    self.websocket = websocket
+                    self._connected = True
+
+                    await self.xmpp_send(
+                        "<open xmlns='urn:ietf:params:xml:ns:xmpp-framing' to='prod.ol.epicgames.com' version='1.0' />"
+                    )
+
+                    async for msg in websocket:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await self.parse_message(msg.data)
+            except aiohttp.client_exceptions.ClientConnectorDNSError:
+                log.debug(
+                    'DNS error when attempting to connect to XMPP, '
+                    'retrying in 5 seconds..'
+                )
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                log.debug("XMPP connect task cancelled")
+                return
+            except RuntimeError:
+                if self.http_session.closed:
+                    log.debug('aiohttp session closed, restarting now...')
+                    await self.restart()
+            finally:
+                await self._close(close_http=False)
 
     async def run(self) -> None:
-        resource_id = (uuid.uuid4().hex).upper()
-        resource = 'V2:Fortnite:{0.client.platform.value}::{1}'.format(
-            self,
-            resource_id
-        )
+        if self._xmpp_task and not self._xmpp_task.done():
+            return
 
-        self.xmpp_client = aioxmpp.PresenceManagedClient(
-            aioxmpp.JID(
-                self.client.user.id,
-                self.client.service_host,
-                resource
-            ),
-            aioxmpp.make_security_layer(
-                self.client.auth.access_token,
-                no_verify=True
-            ),
-            override_peer=[(
-                self.client.service_domain,
-                self.client.service_port,
-                XMPPOverWebsocketConnector(
-                    self.client,
-                    ws_connector=self.ws_connector
-                )
-            )],
-        )
-        self.xmpp_client.backoff_start = datetime.timedelta(seconds=0.1)
+        self.http_session = aiohttp.ClientSession()
+        self._xmpp_task = self.client.loop.create_task(self.connect_to_xmpp())
 
-        self.setup_callbacks()
+        await self._xmpp_ready_event.wait()
 
-        future = self.client.loop.create_future()
-        self._task = asyncio.ensure_future(self._run(future))
-        await future
+    async def restart(self) -> None:
+        if self._restarting:
+            return
 
-        self._ping_task = asyncio.ensure_future(self.loop_ping())
+        self._restarting = True
 
-    async def close(self) -> None:
+        log.debug('Reconnecting to XMPP...')
+
+        await self._close()
+
+        if self._xmpp_task:
+            self._xmpp_task.cancel()
+            try:
+                await self._xmpp_task
+            except asyncio.CancelledError:
+                pass
+            self._xmpp_task = None
+
+        await self.run()
+
+        await asyncio.sleep(2)
+        await self.client._reconnect_to_party()
+
+        self._restarting = False
+
+    async def _close(self, close_http: bool = True) -> None:
         log.debug('Attempting to close xmpp client')
-        if self.xmpp_client.running:
-            self.xmpp_client.stop()
 
-            while self.xmpp_client.running:
-                await asyncio.sleep(0)
+        self._ready = False
+        self._connected = False
+        self._authed = False
+        self._xmpp_ready_event.clear()
 
-        if self._task:
-            self._task.cancel()
-        if self._ping_task:
-            self._ping_task.cancel()
+        tasks = [
+            self._presence_task,
+            self._ping_task,
+            self._watchdog_task,
+            self._xmpp_task
+        ]
+        for task in tasks:
+            if task:
+                task.cancel()
 
+        self._presence_task = None
         self._ping_task = None
-        self.xmpp_client = None
-        self.stream = None
+        self._watchdog_task = None
+        self._xmpp_task = None
 
+        if self.websocket is not None and not self.websocket.closed:
+            try:
+                await asyncio.wait_for(self.websocket.close(), timeout=1.0)
+            except Exception:
+                pass
+
+        self.websocket = None
+
+        if self.http_session and close_http:
+            await self.http_session.close()
+
+            self.http_session = None
+
+        # # let loop run one iteration for events to be dispatched
+        # await asyncio.sleep(0)
+
+        self.client.dispatch_event('xmpp_session_close')
         log.debug('Successfully closed xmpp client')
 
-        # let loop run one iteration for events to be dispatched
-        await asyncio.sleep(0)
 
     def set_presence(self, *,
                      status: Optional[Union[str, dict]] = None,
                      show: Optional[str]) -> None:
         if status is None:
-            self.xmpp_client.presence = aioxmpp.PresenceState(available=True)
-
-        _status = status if isinstance(status, dict) else {'Status': status}
-        self.xmpp_client.set_presence(
-            state=aioxmpp.PresenceState(
-                available=True,
-                show=show
-            ),
-            status=json.dumps(_status)
-        )
-
-    async def send_presence(self, to: Optional[aioxmpp.JID] = None,
-                            status: Optional[Union[str, dict]] = None,
-                            show: Optional[str] = None) -> None:
-        _status = {}
-        if status is None:
-            _status = None
-        elif isinstance(status, str):
-            _status['Status'] = status
-        elif isinstance(status, dict):
-            _status = status
+            self.stanza = "<presence/>"
         else:
-            raise TypeError('status must be None, str or dict')
+            if isinstance(status, dict):
+                _status = status
+            elif self.client.party:
+                _status = self.client.party.construct_presence(text=status)
+            else:
+                _status = {
+                    "Status": status,
+                    "ProductName": "Fortnite"
+                }
 
-        pres = aioxmpp.Presence(
-            type_=aioxmpp.PresenceType.AVAILABLE,
-            show=aioxmpp.PresenceShow(show),
-            to=to,
-        )
+            self.stanza = (
+                f"<presence from='{self.local_jid}'>"
+                f"<status>{json.dumps(_status)}</status>"
+                f"<show>{show}</show>"
+                f"</presence>"
+            )
 
-        if _status is not None:
-            pres.status[None] = json.dumps(_status)
-        await self.stream.send(pres)
+    async def send_presence(
+        self,
+        to: Optional[str] = None,
+        status: Optional[Union[str, dict]] = None,
+        show: Optional[str] = None,
+    ) -> None:
+        if status is None:
+            status_json = None
+        elif isinstance(status, str):
+            if self.client.party:
+                status_json = json.dumps(
+                    self.client.party.construct_presence(text=status)
+                )
+            else:
+                status_json = json.dumps({"Status": status})
+        elif isinstance(status, dict):
+            status_json = json.dumps(status)
+        else:
+            raise TypeError("status must be None, str or dict")
 
-    async def get_presence(self, jid: aioxmpp.JID) -> Presence:
-        self.client.loop.create_task(self.send_presence_probe(jid))
+        to_attr = f" to='{to}'" if to else ""
+        show_tag = f"<show>{show}</show>" if show else ""
+        status_tag = f"<status>{status_json}</status>" if status_json else ""
+
+        presence = f"<presence{to_attr}>{show_tag}{status_tag}</presence>"
+
+        await self.xmpp_send(presence)
+
+    async def get_presence(self, jid: str):
+        await self.send_presence_probe(jid)
+
+        # Wait for incoming friend presence event
         _, after = await self.client.wait_for(
             'friend_presence',
-            check=lambda b, a: a.friend.id == jid.localpart
+            check=lambda b, a: a.friend.id == jid.split("@")[0]
         )
         return after
 
-    async def send_presence_probe(self, to: aioxmpp.JID) -> None:
-        presence = aioxmpp.Presence(
-            type_=aioxmpp.PresenceType.PROBE,
-            to=to
-        )
-        await self.stream.send(presence)
+    async def send_presence_probe(self, to: str) -> None:
+        await self.xmpp_send(f"<presence to='{to}' type='probe'/>")
+

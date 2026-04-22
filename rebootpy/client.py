@@ -26,11 +26,16 @@ import datetime
 import asyncio
 import logging
 import time
+import base64
+import uuid
+import json
 
-from aioxmpp import JID
 from aiohttp import BaseConnector
 from typing import (Iterable, Union, Optional, Any, Awaitable, Callable, Dict,
                     List, Tuple)
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 from .errors import (PartyError, HTTPException, NotFound, Forbidden,
                      DuplicateFriendship, FriendshipRequestAlreadySent,
@@ -43,7 +48,7 @@ from .user import (ClientUser, User, BlockedUser, SacSearchEntryUser,
                    UserSearchEntry)
 from .friend import Friend, IncomingPendingFriend, OutgoingPendingFriend
 from .enums import (Platform, Region, UserSearchPlatform, AwayStatus,
-                    StatsCollectionType, Season)
+                    StatsCollectionType, Season, Country)
 from .party import (DefaultPartyConfig, DefaultPartyMemberConfig, ClientParty,
                     Party)
 from .stats import StatsV2, StatsCollection, _StatsBase, CompetitiveRank
@@ -491,13 +496,14 @@ class BasicClient:
     def __init__(self, auth: Auth,
                  **kwargs: Any) -> None:
         self.cache_users = kwargs.get('cache_users', True)
-        self.build = kwargs.get('build', '++Fortnite+Release-33.00-CL-38324112')  # noqa
+        self.build = kwargs.get('build', '++Fortnite+Release-38.10-CL-47888945')  # noqa
         self.os = kwargs.get('os', 'Windows/10.0.19045.1.768.64bit')
         self.deployment_id = kwargs.get(
             'deployment_id', '62a9473a2dca46b29ccf17577fcf42d7'
         )
 
         self.kill_other_sessions = kwargs.get('kill_other_sessions', True)
+        self.supports_non_eg1 = True
         self.accept_eula = True
         self.event_prefix = 'event_'
 
@@ -722,7 +728,8 @@ class BasicClient:
                 self.auth.account_id,
                 priority=priority
             ),
-            self.http.account_graphql_get_clients_external_auths(
+            self.http.account_get_multiple_by_user_id(
+                [self.auth.account_id],
                 priority=priority
             ),
             self.http.account_get_external_auths_by_id(
@@ -732,17 +739,24 @@ class BasicClient:
         ]
 
         data, ext_data, extra_ext_data, *_ = await asyncio.gather(*tasks)
-        data['externalAuths'] = ext_data['myAccount']['externalAuths'] or []
+        data['externalAuths'] = ext_data[0]['externalAuths'] or []
         data['extraExternalAuths'] = extra_ext_data
         self.user = ClientUser(self, data)
+
+    async def _fetch_user_agent(self, platform: str = 'Windows', priority: int = 0):
+        build_version = await self.http.launcher_get_build(
+            platform=platform,
+            priority=priority
+        )
+
+        if build_version and build_version.count('-'):
+            self.build = build_version.rsplit('-', 1)[0]
 
     async def _login(self, priority: int = 0) -> None:
         log.debug('Running authenticating')
         ret = await self.auth._authenticate(priority=priority)
         if ret is False:
             return False
-
-        await self._setup_client_user(priority=priority)
 
         if self.auth.eula_check_needed() and self.accept_eula:
             await self.auth.accept_eula(
@@ -995,7 +1009,8 @@ class BasicClient:
                     pass
 
         try:
-            data = await self.http.account_get_by_display_name(display_name)
+            lookup = await self.http.account_get_by_display_name(display_name)
+            data = await self.http.account_get_multiple_by_user_id([lookup.get('id')])
         except HTTPException as e:
             error_code = 'errors.com.epicgames.account.account_not_found'
             if e.message_code == error_code:
@@ -1003,8 +1018,8 @@ class BasicClient:
             raise
 
         if raw:
-            return data
-        return self.store_user(data, try_cache=cache)
+            return data[0]
+        return self.store_user(data[0], try_cache=cache)
 
     async def fetch_users_by_display_name(self, display_name: str, *,
                                           raw: bool = False
@@ -1180,6 +1195,35 @@ class BasicClient:
                     else:
                         u = self.store_user(result, try_cache=cache)
                         _users.append(u)
+
+        _users_ids = {
+            user.id if isinstance(user, User) else user["id"]
+            for user in _users
+        }
+        disabled = [
+            user_id for user_id in new if user_id not in _users_ids and user_id
+        ]
+
+        chunk_tasks = []
+        chunks = (disabled[i:i + 100] for i in range(0, len(disabled), 100))
+        for chunk in chunks:
+            task = self.http.account_get_multiple_disabled_by_user_id(chunk)
+            chunk_tasks.append(task)
+
+        if len(chunk_tasks) > 0:
+            d = await asyncio.gather(*chunk_tasks)
+            for results in d:
+                for result in results:
+                    if raw:
+                        _users.append(result)
+                    else:
+                        u = self.store_user(
+                            result,
+                            try_cache=cache,
+                            disabled=True
+                        )
+                        _users.append(u)
+    
         return _users
 
     async def search_users(self, prefix: str,
@@ -1322,7 +1366,12 @@ class BasicClient:
 
         return entries
 
-    def store_user(self, data: dict, *, try_cache: bool = True) -> User:
+    def store_user(self,
+                   data: dict,
+                   *,
+                   try_cache: bool = True,
+                   disabled = False
+                   ) -> User:
         try:
             user_id = data.get(
                 'accountId',
@@ -1334,7 +1383,7 @@ class BasicClient:
         except KeyError:
             pass
 
-        user = User(self, data)
+        user = User(self, data, disabled)
         if self.cache_users:
             self._users[user.id] = user
         return user
@@ -1863,30 +1912,6 @@ class BasicClient:
         return [CompetitiveRank(data=track) for track in raw_tracks
                 if track['trackguid'] in tracks]
 
-    async def fetch_gold_bars(self, user_id: str) -> int:
-        """|coro|
-
-        Fetches the amount of gold bars a user has.
-
-        Parameters
-        ----------
-        user_id: :class:`str`
-            The id of the user you want to fetch gold bars for.
-
-        Raises
-        ------
-        HTTPException
-            An error occurred while requesting.
-
-        Returns
-        -------
-        int
-            The amount of gold bars.
-        """  # noqa
-
-        data = await self.http.fortnite_get_br_inventory(user_id=user_id)
-        return data['stash']['globalcash']
-
     async def fetch_br_stats(self, user_id: str, *,
                              start_time: Optional[DatetimeOrTimestamp] = None,
                              end_time: Optional[DatetimeOrTimestamp] = None
@@ -1942,6 +1967,127 @@ class BasicClient:
                             'from public stats.')
 
         return StatsV2(*results) if results[0] is not None else None
+
+    async def fetch_multiple_event_tokens(self, user_ids: list) -> dict:
+        """|coro|
+
+        Gets event tokens for the specified users.
+
+        Parameters
+        ----------
+        user_ids: :class:`list`
+            A list of user ids you want to fetch event tokens for.
+
+        Raises
+        ------
+        HTTPException
+            An error occurred while requesting.
+
+        Returns
+        -------
+        :class:`dict`:
+            A dictionary with user ids mapped to a list of tokens.
+        """  # noqa
+        chunk_tasks = []
+        chunks = (user_ids[i:i + 100] for i in range(0, len(user_ids), 100))
+
+        for chunk in chunks:
+            task = self.http.events_get_tokens(chunk)
+            chunk_tasks.append(task)
+
+        results = {}
+        if chunk_tasks:
+            results = {
+                k: v
+                for chunk_result in await asyncio.gather(*chunk_tasks)
+                for k, v in chunk_result.items()
+            }
+
+        return results
+
+    async def fetch_event_tokens(self, user_id: str) -> list:
+        """|coro|
+
+        Gets event tokens for the specified user.
+
+        Parameters
+        ----------
+        user_id: :class:`str`
+            The id of the user you want to fetch event tokens for.
+
+        Raises
+        ------
+        HTTPException
+            An error occurred while requesting.
+
+        Returns
+        -------
+        list[:class:`str`]
+            A list of event tokens.
+        """  # noqa
+        data = await self.fetch_multiple_event_tokens((user_id,))
+        return data.get(user_id)
+
+    async def fetch_multiple_flags(self, user_ids: list) -> dict:
+        """|coro|
+
+        Gets the current set flags for the specified users.
+
+        Parameters
+        ----------
+        user_ids: :class:`str`
+            A list of user ids you want to fetch flags for.
+
+        Raises
+        ------
+        HTTPException
+            An error occurred while requesting.
+
+        Returns
+        -------
+        dict[:class:`str`, :class:`Country` | None]
+            A dictionary with user ids mapped to a flag enum.
+        """  # noqa
+        tokens = await self.fetch_multiple_event_tokens(user_ids)
+        results = {
+            user_id: next(
+                (
+                    Country(country)
+                    for token in user_tokens
+                    if token.startswith("GroupIdentity_GeoIdentity_")
+                       and token != "GroupIdentity_GeoIdentity_fortnite"
+                       and (
+                           country := token[len("GroupIdentity_GeoIdentity_"):]
+                       ) in Country._value2member_map_
+                ),
+                None
+            )
+            for user_id, user_tokens in tokens.items()
+        }
+        return results
+
+    async def fetch_flag(self, user_id: str) -> list:
+        """|coro|
+
+        Gets current set flag for the specified user.
+
+        Parameters
+        ----------
+        user_id: :class:`str`
+            The id of the user you want to fetch the flag for.
+
+        Raises
+        ------
+        HTTPException
+            An error occurred while requesting.
+
+        Returns
+        -------
+        :class:`Country` | None
+            The users flag.
+        """  # noqa
+        data = await self.fetch_multiple_flags((user_id,))
+        return data.get(user_id)
 
     async def _multiple_stats_chunk_requester(self, user_ids: List[str], stats: List[str], *,  # noqa
                                               collection: Optional[str] = None,
@@ -2620,7 +2766,7 @@ class Client(BasicClient):
         the same as the above connector.
     status: :class:`str`
         The status you want the client to send with its presence to friends.
-        Defaults to: ``In Lobby - {current_playlist}``.
+        Defaults to: ``{current_playlist}``.
 
         .. note::
 
@@ -2629,8 +2775,7 @@ class Client(BasicClient):
 
             * ``{party_size}`` - Amount of players in the party.
             * ``{party_max_size}`` - Max size of the party.
-            * ``{current_playlist}`` - Uses the same formatting as the normal
-            client e.g. ``Zero Build - Battle Royale - Squad``.
+            * ``{current_playlist}`` - Uses the same formatting as the normal client e.g. ``Battle Royale``.
     away: :class:`AwayStatus`
         The away status the client should use for its presence. Defaults to
         :attr:`AwayStatus.ONLINE`.
@@ -2729,12 +2874,17 @@ class Client(BasicClient):
         self.wait_for_member_meta_in_events = kwargs.get('wait_for_member_meta_in_events', True)  # noqa
         self.leave_party_at_shutdown = kwargs.get('leave_party_at_shutdown', True)  # noqa
 
+        self.supports_non_eg1 = False
         self.xmpp = XMPPClient(self, ws_connector=kwargs.get('ws_connector'))
         self.websocket = WebsocketClient(self)
         self.party = None
 
         self.auto_update_status = '{current_playlist}' in self.status
-        self.current_status_playlist = 'Battle Royale - Squad'
+        self.current_status_playlist = 'Battle Royale'
+
+        self.private_key = None
+        self.public_key_b64 = None
+        self.key_data = {}
 
         self._listeners = {}
         self._events = {}
@@ -2911,12 +3061,14 @@ class Client(BasicClient):
     async def internal_auth_refresh_handler(self):
         try:
             log.debug('Refreshing xmpp session')
-            await self.xmpp.close()
+            await self.xmpp._close()
             await self.xmpp.run()
 
             log.debug('Refreshing websocket session')
             await self.websocket.close()
             await self.websocket.run()
+
+            await asyncio.sleep(2)
 
             await self._reconnect_to_party()
         except AttributeError:
@@ -2936,14 +3088,22 @@ class Client(BasicClient):
         if res is not None:
             return res
 
-        await self.refresh_caches(priority=priority)
+        self.generate_keypair()
+
+        self.key_data, *_ = await asyncio.gather(
+            self.http.register_public_key(
+                public_key=self.public_key_b64
+            ),
+            self.refresh_caches(priority=priority),
+            self.xmpp.run(),
+            self.websocket.run(),
+        )
+
+        # These are here in-case someone just has logging for rebootpy.client
         log.debug('Successfully set up caches')
-
-        await self.xmpp.run()
         log.debug('Connected to XMPP')
-
-        await self.websocket.run()
-        log.debug('Connected to Websocket')
+        log.debug('Connected to websocket')
+        log.debug('Registered public key')
 
         await self.initialize_party(priority=priority)
         log.debug('Party created')
@@ -3055,7 +3215,7 @@ class Client(BasicClient):
                     except KeyError:
                         pass
                     else:
-                        now = datetime.datetime.utcnow()
+                        now = datetime.datetime.now(datetime.timezone.utc)
                         total_seconds = (now - disc_at).total_seconds()
                         if total_seconds < newest_conn.get('offline_ttl', 30):
                             return await self._reconnect_to_party(data=data)
@@ -3140,7 +3300,12 @@ class Client(BasicClient):
             if user is not None:
                 self.store_blocked_user(user)
 
-    def store_user(self, data: dict, *, try_cache: bool = True) -> User:
+    def store_user(self,
+                   data: dict,
+                   *,
+                   try_cache: bool = True,
+                   disabled: bool = False
+                   ) -> User:
         try:
             user_id = data.get(
                 'accountId',
@@ -3152,7 +3317,7 @@ class Client(BasicClient):
         except KeyError:
             pass
 
-        user = User(self, data)
+        user = User(self, data, disabled)
         if self.cache_users:
             self._users[user.id] = user
         return user
@@ -3516,8 +3681,7 @@ class Client(BasicClient):
                     **default_schema,
                     **updated,
                     **edit_updated,
-                    **party._construct_raw_squad_assignments(),
-                    **party.meta.set_voicechat_implementation('EOSVoiceChat')
+                    **party._construct_raw_squad_assignments()
                 },
                 deleted=[*deleted, *edit_deleted],
                 priority=priority,
@@ -3542,6 +3706,11 @@ class Client(BasicClient):
             party = self.construct_party(party_data)
             await party._update_members(party_data['members'])
             self.party = party
+            party_leader = next(
+                member['account_id']
+                for member in party_data['members']
+                if member['role'] == 'CAPTAIN'
+            )
 
             def check(m):
                 if m.id != self.user.id:
@@ -3555,7 +3724,7 @@ class Client(BasicClient):
             )
 
             try:
-                await self.http.party_join_request(party.id)
+                await self.http.party_join_request(party.id, party_leader)
             except HTTPException as e:
                 if not future.cancelled():
                     future.cancel()
@@ -3578,6 +3747,48 @@ class Client(BasicClient):
             raise asyncio.TimeoutError('Party join timed out.')
 
         return party
+
+    def generate_keypair(self) -> None:
+        self.private_key = Ed25519PrivateKey.generate()
+        public_key = self.private_key.public_key()
+
+        public_key_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        self.public_key_b64 = base64.b64encode(public_key_bytes).decode()
+
+    def create_signed_message(self,
+                              conversation_id: str,
+                              content: str,
+                              type: str = "Persistent",
+                              sequence: int = 1
+                              ) -> Tuple[str, str]:
+        timestamp = int(
+            datetime.datetime.now(datetime.timezone.utc).timestamp()
+        )
+
+        message_info = {
+            "mid": uuid.uuid4().hex,
+            "sid": self.user.id,
+            "rid": conversation_id,
+            "msg": content,
+            "tst": timestamp,
+            "seq": sequence,
+            "rec": False,
+            "mts": [],
+            "cty": type
+        }
+
+        body = base64.b64encode(
+            json.dumps(message_info).encode()
+        ).decode("utf-8")
+        message = body.encode() + bytes([0])
+        signature = self.private_key.sign(message)
+        signature_string = base64.b64encode(signature).decode()
+
+        return body, signature_string
 
     async def join_party(self, party_id: str) -> ClientParty:
         """|coro|
@@ -3685,7 +3896,7 @@ class Client(BasicClient):
 
     async def send_presence(self, status: Union[str, dict], *,
                             away: AwayStatus = AwayStatus.ONLINE,
-                            to: Optional[JID] = None) -> None:
+                            to: Optional[str] = None) -> None:
         """|coro|
 
         Sends this status to all or one single friend.
@@ -3718,6 +3929,7 @@ class Client(BasicClient):
         the lobby (i.e. go to your locker and back) to see platform changes
         in the same party.
 
+
         Parameters
         ----------
         platform: :class:`Platform`
@@ -3730,11 +3942,12 @@ class Client(BasicClient):
         """
         self.platform = platform
 
-        await self.xmpp.close()
-        await self.xmpp.run()
-
-        await asyncio.sleep(2)
-        await self._reconnect_to_party()
+        # await self.xmpp._close()
+        # await self.xmpp.run()
+        #
+        # await asyncio.sleep(2)
+        # await self._reconnect_to_party()
+        await self.xmpp.restart()
 
     async def auto_update_status_text(self) -> None:
         if not self.party:
@@ -3744,17 +3957,5 @@ class Client(BasicClient):
             code=self.party.playlist_info[0]
         )
 
-        if playlist.is_creative_island:
-            self.current_status_playlist = playlist.name
-        elif 'nobuildbr' in playlist.mnemonic:
-            self.current_status_playlist = 'Zero Build - Battle Royale - ' \
-                                           f'{playlist.name}'
-        elif 'playlist_default' in playlist.mnemonic:
-            self.current_status_playlist = f'Battle Royale - {playlist.name}'
-        elif ('blastberrynobuild' in playlist.mnemonic or
-              'sunflowernobuild' in playlist.mnemonic):
-            self.current_status_playlist = 'Reload - Zero Build - ' \
-                                           f'{playlist.name}'
-        elif ('blastberry' in playlist.mnemonic or
-              'sunflower' in playlist.mnemonic):
-            self.current_status_playlist = f'Reload - {playlist.name}'
+        self.current_status_playlist = playlist.name
+        self.party.update_presence()
